@@ -158,11 +158,7 @@ class WebSocketApp:
         self.sock: Optional[WebSocket] = None
         self.last_ping_tm = float(0)
         self.last_pong_tm = float(0)
-        self.ping_thread: Optional[threading.Thread] = None
-        self.stop_ping: Optional[threading.Event] = None
-        self.ping_interval = float(0)
-        self.ping_timeout: Optional[Union[float, int]] = None
-        self.ping_payload = ""
+        
         self.subprotocols = subprotocols
         self.prepared_socket = socket
         self.has_errored = False
@@ -208,48 +204,6 @@ class WebSocketApp:
             self.sock.close(**kwargs)
             self.sock = None
 
-    def _start_ping_thread(self) -> None:
-        self.last_ping_tm = self.last_pong_tm = float(0)
-        self.stop_ping = threading.Event()
-        self.ping_thread = threading.Thread(target=self._send_ping)
-        self.ping_thread.daemon = True
-        self.ping_thread.start()
-
-    def _stop_ping_thread(self) -> None:
-        if self.stop_ping:
-            self.stop_ping.set()
-        if self.ping_thread and self.ping_thread.is_alive():
-            self.ping_thread.join(3)
-            # Handle thread leak - if thread doesn't terminate within timeout,
-            # force cleanup and log warning instead of abandoning the thread
-            if self.ping_thread.is_alive():
-                _logging.warning(
-                    "Ping thread failed to terminate within 3 seconds, "
-                    "forcing cleanup. Thread may be blocked."
-                )
-                # Force cleanup by clearing references even if thread is still alive
-                # The daemon thread will eventually be cleaned up by Python's GC
-                # but we prevent resource leaks by not holding references
-
-        # Always clean up references regardless of thread state
-        self.ping_thread = None
-        self.stop_ping = None
-        self.last_ping_tm = self.last_pong_tm = float(0)
-
-    def _send_ping(self) -> None:
-        if self.stop_ping is None:
-            return
-        if self.stop_ping.wait(self.ping_interval) or self.keep_running is False:
-            return
-        while not self.stop_ping.wait(self.ping_interval) and self.keep_running is True:
-            if self.sock:
-                self.last_ping_tm = time.time()
-                try:
-                    _logging.debug("Sending ping")
-                    self.sock.ping(self.ping_payload)
-                except Exception as e:
-                    _logging.debug(f"Failed to send ping: {e}")
-
     def ready(self):
         return self.sock and self.sock.connected
 
@@ -257,9 +211,6 @@ class WebSocketApp:
         self,
         sockopt: tuple = None,
         sslopt: dict = None,
-        ping_interval: Union[float, int] = 0,
-        ping_timeout: Optional[Union[float, int]] = None,
-        ping_payload: str = "",
         http_proxy_host: str = None,
         http_proxy_port: Union[int, str] = None,
         http_no_proxy: list = None,
@@ -286,14 +237,7 @@ class WebSocketApp:
             and each element is argument of sock.setsockopt.
         sslopt: dict
             Optional dict object for ssl socket option.
-        ping_interval: int or float
-            Automatically send "ping" command
-            every specified period (in seconds).
-            If set to 0, no ping is sent periodically.
-        ping_timeout: int or float
-            Timeout (in seconds) if the pong message is not received.
-        ping_payload: str
-            Payload message to send with each ping.
+            
         http_proxy_host: str
             HTTP proxy host name.
         http_proxy_port: int or str
@@ -329,12 +273,6 @@ class WebSocketApp:
         if reconnect is None:
             reconnect = RECONNECT
 
-        if ping_timeout is not None and ping_timeout <= 0:
-            raise WebSocketException("Ensure ping_timeout > 0")
-        if ping_interval is not None and ping_interval < 0:
-            raise WebSocketException("Ensure ping_interval >= 0")
-        if ping_timeout and ping_interval and ping_interval <= ping_timeout:
-            raise WebSocketException("Ensure ping_interval > ping_timeout")
         if not sockopt:
             sockopt = ()
         if not sslopt:
@@ -342,9 +280,6 @@ class WebSocketApp:
         if self.sock:
             raise WebSocketException("socket is already opened")
 
-        self.ping_interval = ping_interval
-        self.ping_timeout = ping_timeout
-        self.ping_payload = ping_payload
         self.has_done_teardown = False
         self.keep_running = True
 
@@ -366,7 +301,6 @@ class WebSocketApp:
                     return
                 self.has_done_teardown = True
 
-            self._stop_ping_thread()
             self.keep_running = False
 
             if self.sock:
@@ -420,9 +354,6 @@ class WebSocketApp:
                 )
 
                 _logging.info("Websocket connected")
-
-                if self.ping_interval:
-                    self._start_ping_thread()
 
                 if reconnecting and self.on_reconnect:
                     self._callback(self.on_reconnect)
@@ -479,26 +410,6 @@ class WebSocketApp:
             return True
 
         def check() -> bool:
-            if self.ping_timeout:
-                has_timeout_expired = (
-                    time.time() - self.last_ping_tm > self.ping_timeout
-                )
-                has_pong_not_arrived_after_last_ping = (
-                    self.last_pong_tm - self.last_ping_tm < 0
-                )
-                has_pong_arrived_too_late = (
-                    self.last_pong_tm - self.last_ping_tm > self.ping_timeout
-                )
-
-                if (
-                    self.last_ping_tm
-                    and has_timeout_expired
-                    and (
-                        has_pong_not_arrived_after_last_ping
-                        or has_pong_arrived_too_late
-                    )
-                ):
-                    raise WebSocketTimeoutException("ping/pong timed out")
             return True
 
         def closed(
@@ -526,7 +437,6 @@ class WebSocketApp:
             reconnecting: bool = False,
         ) -> bool:
             self.has_errored = True
-            self._stop_ping_thread()
             if not reconnecting:
                 self._callback(self.on_error, e)
 
@@ -549,7 +459,7 @@ class WebSocketApp:
 
         custom_dispatcher = bool(dispatcher)
         dispatcher = self.create_dispatcher(
-            ping_timeout, dispatcher, parse_url(self.url)[3], closed
+            None, dispatcher, parse_url(self.url)[3], closed
         )
 
         try:
@@ -579,7 +489,7 @@ class WebSocketApp:
     ) -> Union[Dispatcher, SSLDispatcher, WrappedDispatcher]:
         if dispatcher:  # If custom dispatcher is set, use WrappedDispatcher
             return WrappedDispatcher(self, ping_timeout, dispatcher, handleDisconnect)
-        timeout = ping_timeout or 10
+        timeout = ping_timeout or 60
         if is_ssl:
             return SSLDispatcher(self, timeout)
         return Dispatcher(self, timeout)
